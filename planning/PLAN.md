@@ -167,7 +167,9 @@ Both the simulator and the Massive client implement the same abstract interface.
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache holds the latest price, previous price, timestamp, and open/reference price for each ticker
+- The open price is the simulator seed price (or first price received from Massive) — used to compute daily change %
+- Each ticker also maintains a rolling buffer of the last 200 price points for the chart history endpoint
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
@@ -176,7 +178,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
 - Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Each SSE event contains ticker, price, previous price, open price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -252,6 +254,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/stream/prices` | SSE stream of live price updates |
+| GET | `/api/prices/{ticker}/history` | Rolling buffer of last 200 price points for a ticker (in-memory, resets on restart) |
 
 ### Portfolio
 | Method | Path | Description |
@@ -352,7 +355,7 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change % (calculated frontend-side as `(current - open_price) / open_price * 100` using the `open_price` field from SSE), and a sparkline mini-chart (accumulated from SSE since page load)
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
@@ -454,3 +457,60 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes
+
+### Questions & Clarifications
+
+**Section 6 — Dynamic tickers in the price cache**
+When a user adds a new ticker to their watchlist mid-session, how does the background task react? Does the simulator automatically start generating prices for that ticker, or does the watchlist change need to signal the background task? The plan says the SSE stream covers "all tickers known to the system" but doesn't specify the handoff mechanism for newly added tickers.
+
+**Section 6 — Massive API with dynamic watchlists**
+The Massive poller is described as polling "the union of all watched tickers." Does it re-read the watchlist database on each poll cycle, or does it hold an in-memory set that needs explicit notification when the watchlist changes? This needs to be explicit in the implementation contract.
+
+**Section 6 — SSE cadence vs. Massive API polling interval**
+The SSE stream pushes at ~500ms, but Massive free-tier polls every 15 seconds. What does the SSE stream send between Massive polls — repeated stale prices, or nothing? If stale prices are repeated, the price flash animations would fire constantly on unchanged data. If nothing is sent, clients may think the connection dropped. This needs a defined behavior (e.g., heartbeat-only events between polls, or push-on-change only).
+
+**Section 7 — Lazy initialization timing**
+"The backend checks for the SQLite database on startup (or first request)" is ambiguous. SSE clients connect immediately on page load, before any REST request completes. If initialization is deferred to the first REST request, the SSE stream could start before the watchlist table exists. Recommend committing to startup-time initialization.
+
+**Section 8 — Missing ticker history endpoint** ✅ DECIDED
+The main chart area shows "price over time" for a selected ticker, but no API endpoint exists for fetching per-ticker price history. The SSE stream only accumulates data since page load. What is shown in the chart before SSE data builds up? Is the backend expected to store per-ticker price history (not currently in the schema), or does the chart simply start empty?
+> **Decision**: Extend the in-memory price cache to keep a rolling buffer of the last 200 price points per ticker. Expose via `GET /api/prices/{ticker}/history`. No schema change required; buffer resets on restart (acceptable for a demo). Chart fills immediately on first click.
+
+**Section 9 — Conversation history truncation**
+The chat flow loads "recent conversation history from `chat_messages`" but doesn't define how many messages or how to handle long sessions. Without a truncation strategy, context can grow unboundedly and eventually exceed the model's context window or inflate latency. A defined limit (e.g., last N turns) should be specified.
+
+**Section 9 — Trade failure error flow**
+Step 6 says "if a trade fails validation, the error is included in the chat response." But step 5 says the structured JSON response is already parsed at that point — the LLM has already generated its `message`. Does the backend modify the LLM's `message` before returning it, append an error note, or return a separate error field alongside the LLM's message? The response contract for partial failures isn't defined.
+
+**Section 10 — Daily change % source** ✅ DECIDED
+The watchlist panel should show "daily change %" but the SSE event only provides `price`, `previous price`, `timestamp`, and `change direction`. The simulator has no concept of a market open price. Does "daily change %" mean change since page load, change from a fixed seed price, or is it expected to be derived from something else? This needs to be defined so the frontend and backend agree.
+> **Decision**: Use the simulator seed price as the reference "open" price (first price received for Massive API). Include `open_price` in every SSE event. Frontend computes `(current - open_price) / open_price * 100`. This is honest, consistent, and requires no schema changes.
+
+---
+
+### Simplification Opportunities
+
+**Redundant SSE field — `change direction`**
+The SSE event schema includes a `change direction` field, but this is fully derivable by comparing `price` and `previous price`. Removing it simplifies both the server emission and the SSE contract without losing anything.
+
+**Redundant prices in `GET /api/watchlist`**
+The watchlist endpoint returns "current watchlist tickers with latest prices," but the SSE stream is already the authoritative live price source. This creates two code paths on the frontend for the same data. Simpler alternative: return only tickers from `GET /api/watchlist` and let SSE be the single source of truth for prices (with an initial price available after the first SSE event).
+
+**Confusing `db/` naming**
+Two directories named `db/` exist: `backend/db/` (schema/seed SQL) and the top-level `db/` (runtime SQLite volume mount). Renaming `backend/db/` to `backend/schema/` would eliminate the ambiguity with zero functional change.
+
+**Frontend unit tests scope**
+Frontend unit tests (React Testing Library) for charting components and SSE-integrated displays are expensive to write and brittle to maintain for a capstone project. The SSE integration, price flash animations, and canvas-based charts are all better covered by the E2E Playwright tests. Consider dropping the frontend unit test tier entirely and covering frontend correctness through E2E tests only.
+
+**`start_mac.sh` naming mismatch**
+The script is named `start_mac.sh` but documented as working on "macOS/Linux." Renaming to `start.sh` / `stop.sh` would match the documented behavior without implying macOS-only.
+
+**`openrouter/openai/gpt-oss-120b` vs. "Cerebras for fast inference"**
+Section 3 describes the AI integration as "LiteLLM → OpenRouter (Cerebras for fast inference)" but Section 9 specifies the model as `openrouter/openai/gpt-oss-120b`, which is an OpenAI model routed through OpenRouter with Cerebras as the inference provider. This distinction is non-obvious. Clarify: the model is a GPT-class model; Cerebras is the hardware/inference provider, not the model family.
+
+**`users_profile` table naming**
+The table is named `users_profile` (plural noun, singular concept) in a single-user system. `user_profile` would be more consistent with the rest of the schema and less likely to confuse implementors.
