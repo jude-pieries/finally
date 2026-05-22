@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: LiteLLM → OpenRouter → Cerebras inference hardware (model: `openrouter/openai/gpt-oss-120b`); structured outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -88,13 +88,13 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── schema/               # Schema definitions, seed data, migration logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
 ├── scripts/
-│   ├── start_mac.sh          # Launch Docker container (macOS/Linux)
-│   ├── stop_mac.sh           # Stop Docker container (macOS/Linux)
+│   ├── start.sh              # Launch Docker container (macOS/Linux)
+│   ├── stop.sh               # Stop Docker container (macOS/Linux)
 │   ├── start_windows.ps1     # Launch Docker container (Windows PowerShell)
 │   └── stop_windows.ps1      # Stop Docker container (Windows PowerShell)
 ├── test/                     # Playwright E2E tests + docker-compose.test.yml
@@ -110,7 +110,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/schema/`** contains schema SQL definitions and seed logic.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -170,6 +170,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 - The cache holds the latest price, previous price, timestamp, and open/reference price for each ticker
 - The open price is the simulator seed price (or first price received from Massive) — used to compute daily change %
 - Each ticker also maintains a rolling buffer of the last 200 price points for the chart history endpoint
+- The background task re-reads the watchlist from the database on each poll cycle — newly added tickers are included automatically; the simulator seeds new tickers with a realistic starting price on first encounter
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
@@ -177,8 +178,8 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, open price, timestamp, and change direction
+- Push-on-change: the server only emits an event when a price actually changes — no repeated stale prices. A comment-only keepalive (`: keepalive`) is sent every 10 seconds to prevent connection timeout.
+- Each SSE event contains: `ticker`, `price`, `previous_price`, `open_price`, `timestamp`. Change direction is derived client-side by comparing `price` to `previous_price`.
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -187,7 +188,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 ### SQLite with Lazy Initialization
 
-The backend checks for the SQLite database on startup (or first request). If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
+The backend initializes the SQLite database at startup — before accepting any connections. If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
 
 - No separate migration step
 - No manual database setup
@@ -197,7 +198,7 @@ The backend checks for the SQLite database on startup (or first request). If the
 
 All tables include a `user_id` column defaulting to `"default"`. This is hardcoded for now (single-user) but enables future multi-user support without schema migration.
 
-**users_profile** — User state (cash balance)
+**user_profile** — User state (cash balance)
 - `id` TEXT PRIMARY KEY (default: `"default"`)
 - `cash_balance` REAL (default: `10000.0`)
 - `created_at` TEXT (ISO timestamp)
@@ -266,7 +267,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/watchlist` | Current watchlist tickers with latest prices |
+| GET | `/api/watchlist` | Current watchlist tickers (no prices — use SSE stream for live prices) |
 | POST | `/api/watchlist` | Add a ticker: `{ticker}` |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
 
@@ -293,7 +294,7 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the last 20 messages (10 turns) from `chat_messages` — older history is excluded to bound context size
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
@@ -321,6 +322,9 @@ The LLM is instructed to respond with JSON matching this schema:
 - `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
 - `watchlist_changes` (optional): Array of watchlist modifications
 
+The backend wraps the LLM output before returning it to the frontend, adding:
+- `errors` (array, may be empty): trade validation failures appended after execution, e.g. `["Insufficient cash to buy 100 AAPL"]`
+
 ### Auto-Execution
 
 Trades specified by the LLM execute automatically — no confirmation dialog. This is a deliberate design choice:
@@ -328,7 +332,7 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+If a trade fails validation (e.g., insufficient cash), the backend appends the error to an `errors` array in the API response. The LLM's `message` is not modified. The frontend displays errors inline in the chat panel below the assistant's message.
 
 ### System Prompt Guidance
 
@@ -406,13 +410,13 @@ The `db/` directory in the project root maps to `/app/db` in the container. The 
 
 ### Start/Stop Scripts
 
-**`scripts/start_mac.sh`** (macOS/Linux):
+**`scripts/start.sh`** (macOS/Linux):
 - Builds the Docker image if not already built (or if `--build` flag passed)
 - Runs the container with the volume mount, port mapping, and `.env` file
 - Prints the URL to access the app
 - Optionally opens the browser
 
-**`scripts/stop_mac.sh`** (macOS/Linux):
+**`scripts/stop.sh`** (macOS/Linux):
 - Stops and removes the running container
 - Does NOT remove the volume (data persists)
 
@@ -428,20 +432,13 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ## 12. Testing Strategy
 
-### Unit Tests (within `frontend/` and `backend/`)
+### Unit Tests (within `backend/`)
 
 **Backend (pytest)**:
 - Market data: simulator generates valid prices, GBM math is correct, Massive API response parsing works, both implementations conform to the abstract interface
 - Portfolio: trade execution logic, P&L calculations, edge cases (selling more than owned, buying with insufficient cash, selling at a loss)
 - LLM: structured output parsing handles all valid schemas, graceful handling of malformed responses, trade validation within chat flow
 - API routes: correct status codes, response shapes, error handling
-
-**Frontend (React Testing Library or similar)**:
-- Component rendering with mock data
-- Price flash animation triggers correctly on price changes
-- Watchlist CRUD operations
-- Portfolio display calculations
-- Chat message rendering and loading state
 
 ### E2E Tests (in `test/`)
 
@@ -464,27 +461,33 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### Questions & Clarifications
 
-**Section 6 — Dynamic tickers in the price cache**
+**Section 6 — Dynamic tickers in the price cache** ✅ DECIDED
 When a user adds a new ticker to their watchlist mid-session, how does the background task react? Does the simulator automatically start generating prices for that ticker, or does the watchlist change need to signal the background task? The plan says the SSE stream covers "all tickers known to the system" but doesn't specify the handoff mechanism for newly added tickers.
+> **Decision**: The background task re-reads the watchlist from the database on each poll cycle. No explicit signaling needed. The simulator seeds new tickers with a realistic starting price on first encounter.
 
-**Section 6 — Massive API with dynamic watchlists**
+**Section 6 — Massive API with dynamic watchlists** ✅ DECIDED
 The Massive poller is described as polling "the union of all watched tickers." Does it re-read the watchlist database on each poll cycle, or does it hold an in-memory set that needs explicit notification when the watchlist changes? This needs to be explicit in the implementation contract.
+> **Decision**: Same as above — re-reads the watchlist from the database on each poll cycle. No in-memory set, no explicit notification.
 
-**Section 6 — SSE cadence vs. Massive API polling interval**
+**Section 6 — SSE cadence vs. Massive API polling interval** ✅ DECIDED
 The SSE stream pushes at ~500ms, but Massive free-tier polls every 15 seconds. What does the SSE stream send between Massive polls — repeated stale prices, or nothing? If stale prices are repeated, the price flash animations would fire constantly on unchanged data. If nothing is sent, clients may think the connection dropped. This needs a defined behavior (e.g., heartbeat-only events between polls, or push-on-change only).
+> **Decision**: Push-on-change only. A comment-only SSE keepalive (`: keepalive`) is sent every 10 seconds. Flash animations only fire on real price changes.
 
-**Section 7 — Lazy initialization timing**
+**Section 7 — Lazy initialization timing** ✅ DECIDED
 "The backend checks for the SQLite database on startup (or first request)" is ambiguous. SSE clients connect immediately on page load, before any REST request completes. If initialization is deferred to the first REST request, the SSE stream could start before the watchlist table exists. Recommend committing to startup-time initialization.
+> **Decision**: Startup-time initialization — database is ready before the server accepts any connections.
 
 **Section 8 — Missing ticker history endpoint** ✅ DECIDED
 The main chart area shows "price over time" for a selected ticker, but no API endpoint exists for fetching per-ticker price history. The SSE stream only accumulates data since page load. What is shown in the chart before SSE data builds up? Is the backend expected to store per-ticker price history (not currently in the schema), or does the chart simply start empty?
 > **Decision**: Extend the in-memory price cache to keep a rolling buffer of the last 200 price points per ticker. Expose via `GET /api/prices/{ticker}/history`. No schema change required; buffer resets on restart (acceptable for a demo). Chart fills immediately on first click.
 
-**Section 9 — Conversation history truncation**
+**Section 9 — Conversation history truncation** ✅ DECIDED
 The chat flow loads "recent conversation history from `chat_messages`" but doesn't define how many messages or how to handle long sessions. Without a truncation strategy, context can grow unboundedly and eventually exceed the model's context window or inflate latency. A defined limit (e.g., last N turns) should be specified.
+> **Decision**: Load the last 20 messages (10 turns). Older history is excluded.
 
-**Section 9 — Trade failure error flow**
+**Section 9 — Trade failure error flow** ✅ DECIDED
 Step 6 says "if a trade fails validation, the error is included in the chat response." But step 5 says the structured JSON response is already parsed at that point — the LLM has already generated its `message`. Does the backend modify the LLM's `message` before returning it, append an error note, or return a separate error field alongside the LLM's message? The response contract for partial failures isn't defined.
+> **Decision**: The LLM's `message` is not modified. The backend appends trade validation failures to an `errors` array in the API response wrapper. Frontend displays errors inline below the assistant's message.
 
 **Section 10 — Daily change % source** ✅ DECIDED
 The watchlist panel should show "daily change %" but the SSE event only provides `price`, `previous price`, `timestamp`, and `change direction`. The simulator has no concept of a market open price. Does "daily change %" mean change since page load, change from a fixed seed price, or is it expected to be derived from something else? This needs to be defined so the frontend and backend agree.
@@ -494,23 +497,23 @@ The watchlist panel should show "daily change %" but the SSE event only provides
 
 ### Simplification Opportunities
 
-**Redundant SSE field — `change direction`**
+**Redundant SSE field — `change direction`** ✅ APPLIED
 The SSE event schema includes a `change direction` field, but this is fully derivable by comparing `price` and `previous price`. Removing it simplifies both the server emission and the SSE contract without losing anything.
 
-**Redundant prices in `GET /api/watchlist`**
+**Redundant prices in `GET /api/watchlist`** ✅ APPLIED
 The watchlist endpoint returns "current watchlist tickers with latest prices," but the SSE stream is already the authoritative live price source. This creates two code paths on the frontend for the same data. Simpler alternative: return only tickers from `GET /api/watchlist` and let SSE be the single source of truth for prices (with an initial price available after the first SSE event).
 
-**Confusing `db/` naming**
-Two directories named `db/` exist: `backend/db/` (schema/seed SQL) and the top-level `db/` (runtime SQLite volume mount). Renaming `backend/db/` to `backend/schema/` would eliminate the ambiguity with zero functional change.
+**Confusing `db/` naming** ✅ APPLIED
+Two directories named `db/` exist: `backend/db/` (schema/seed SQL) and the top-level `db/` (runtime SQLite volume mount). Renaming `backend/db/` to `backend/schema/` eliminates the ambiguity with zero functional change.
 
-**Frontend unit tests scope**
-Frontend unit tests (React Testing Library) for charting components and SSE-integrated displays are expensive to write and brittle to maintain for a capstone project. The SSE integration, price flash animations, and canvas-based charts are all better covered by the E2E Playwright tests. Consider dropping the frontend unit test tier entirely and covering frontend correctness through E2E tests only.
+**Frontend unit tests scope** ✅ APPLIED
+Frontend unit tests (React Testing Library) for charting components and SSE-integrated displays are expensive to write and brittle to maintain for a capstone project. The SSE integration, price flash animations, and canvas-based charts are all better covered by the E2E Playwright tests. Frontend unit test tier dropped; frontend correctness covered by E2E tests only.
 
-**`start_mac.sh` naming mismatch**
-The script is named `start_mac.sh` but documented as working on "macOS/Linux." Renaming to `start.sh` / `stop.sh` would match the documented behavior without implying macOS-only.
+**`start_mac.sh` naming mismatch** ✅ APPLIED
+The script is named `start_mac.sh` but documented as working on "macOS/Linux." Renamed to `start.sh` / `stop.sh` to match the documented behavior and avoid implying macOS-only.
 
-**`openrouter/openai/gpt-oss-120b` vs. "Cerebras for fast inference"**
-Section 3 describes the AI integration as "LiteLLM → OpenRouter (Cerebras for fast inference)" but Section 9 specifies the model as `openrouter/openai/gpt-oss-120b`, which is an OpenAI model routed through OpenRouter with Cerebras as the inference provider. This distinction is non-obvious. Clarify: the model is a GPT-class model; Cerebras is the hardware/inference provider, not the model family.
+**`openrouter/openai/gpt-oss-120b` vs. "Cerebras for fast inference"** ✅ APPLIED
+Section 3 described the AI integration as "LiteLLM → OpenRouter (Cerebras for fast inference)" but Section 9 specifies the model as `openrouter/openai/gpt-oss-120b`, which is an OpenAI model routed through OpenRouter with Cerebras as the inference provider. Clarified: the model is a GPT-class model; Cerebras is the hardware/inference provider, not the model family.
 
-**`users_profile` table naming**
-The table is named `users_profile` (plural noun, singular concept) in a single-user system. `user_profile` would be more consistent with the rest of the schema and less likely to confuse implementors.
+**`users_profile` table naming** ✅ APPLIED
+The table was named `users_profile` (plural noun, singular concept) in a single-user system. Renamed to `user_profile` for consistency with the rest of the schema.
