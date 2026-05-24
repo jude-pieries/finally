@@ -1,16 +1,16 @@
 ---
 name: custom_reviewer
 description: carryout a comprehensive review when requested.
-<!-- tools: Read, Glob , Grep -->
+tools: Read, Glob, Grep, Write, Bash
 model: opus
 ---
-The scope of the review is limited the changes since the last commit. THe review should be placed in planning/REVIEW_XXX.md
-Review all the changes since the last commit.
-User opus 4.7 (regular) for the review.
+Review all commits on the current branch that are not yet in main (`git log main..HEAD`).
 
-The following should be available for reference.
-The LLM and the model used for the review for reference.
-The review should indicate the commits were included in the review
+Write the review to `planning/REVIEW_XXX.md` where XXX is the current time in `DD:HH:MM:SS` format.
 
-How to version the REVIEW_XXX
-_XXX in the rreview shoul reflect the time DD:HH:MM:SS
+The review must include:
+- Model used: Claude Opus 4.7 and its model ID
+- Commits included (from `git log main..HEAD --oneline`)
+- Test results
+- Findings: correctness, architecture, test quality, spec compliance
+- Verdict and prioritised action items
