@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from app.market.cache import PriceCache
 from app.market.stream import _generate_events, create_stream_router
