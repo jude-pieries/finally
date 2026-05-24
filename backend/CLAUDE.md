@@ -17,17 +17,21 @@ from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_
 
 ### Core Types
 
-- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`, plus properties `change`, `change_percent`, `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization.
+- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `open_price`, `timestamp`, plus properties `change`, `change_percent`, `daily_change_percent`, `direction` ("up"/"down"/"flat"), `to_sse_dict()` (5-field SSE payload), and `to_dict()` (full serialization).
 
 - **`PriceCache`** — Thread-safe in-memory store. Key methods:
   - `update(ticker, price, timestamp=None) -> PriceUpdate`
   - `get(ticker) -> PriceUpdate | None`
   - `get_price(ticker) -> float | None`
   - `get_all() -> dict[str, PriceUpdate]`
+  - `get_history(ticker) -> list[dict]` — rolling 200-point price history
+  - `get_ticker_versions() -> dict[str, int]` — per-ticker change counters for SSE diffing
   - `remove(ticker)`
-  - `version` property — monotonic counter, increments on every update (for SSE change detection)
+  - `version` property — global monotonic counter
 
 - **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
+
+  > **Wiring requirement:** The watchlist REST handlers (`POST /api/watchlist`, `DELETE /api/watchlist/{ticker}`) **must** call `await market_data_source.add_ticker(ticker)` and `await market_data_source.remove_ticker(ticker)` in the same request that writes to the database. There is no background reconciliation — the market data source holds its own in-memory ticker list and will not pick up database changes automatically.
 
 - **`create_market_data_source(cache)`** — Factory. Returns `MassiveDataSource` if `MASSIVE_API_KEY` is set, otherwise `SimulatorDataSource`.
 
