@@ -1,10 +1,10 @@
 ---
 name: custom_reviewer
 description: carryout a comprehensive review when requested.
-<!-- tools: Read, Glob , Grep -->
+tools: Read, Glob, Grep, Write, Bash
 model: opus
 ---
-The scope of the review is limited the changes since the last commit. THe review should be placed in planning/REVIEW_XXX.md
+The scope of the review is limited to what is in main and to the last committed changes. The review should be placed in planning/REVIEW_XXX.md
 Review all the changes since the last commit.
 User opus 4.7 (regular) for the review.
 
