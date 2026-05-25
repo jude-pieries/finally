@@ -3,14 +3,14 @@
 Run with:  uv run market_data_demo.py
 
 Displays a live-updating terminal dashboard of simulated stock prices
-using the GBM simulator and Rich library.
+using the GBM simulator and Rich library. Demonstrates the full PriceCache
+API including get_history(), daily_change_percent, and push-on-change versioning.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
 
 from rich.console import Console
 from rich.layout import Layout
@@ -20,7 +20,6 @@ from rich.table import Table
 from rich.text import Text
 
 from app.market.cache import PriceCache
-from app.market.seed_prices import SEED_PRICES
 from app.market.simulator import SimulatorDataSource
 
 # Sparkline characters, low to high
@@ -29,11 +28,12 @@ SPARK_CHARS = "▁▂▃▄▅▆▇█"
 # Ordered ticker list matching the default watchlist
 TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]
 
-DURATION = 60  # seconds
+DURATION = 60       # seconds to run before auto-exit
+SPARK_POINTS = 40   # number of history points to show in sparkline
 
 
 def sparkline(values: list[float]) -> str:
-    """Render a sequence of values as a unicode sparkline."""
+    """Render a sequence of floats as a unicode sparkline."""
     if len(values) < 2:
         return ""
     lo, hi = min(values), max(values)
@@ -44,72 +44,68 @@ def sparkline(values: list[float]) -> str:
     return "".join(SPARK_CHARS[int((v - lo) / spread * n)] for v in values)
 
 
-def format_price(price: float) -> str:
-    """Format a price with comma separator."""
-    if price >= 1000:
-        return f"{price:,.2f}"
-    return f"{price:.2f}"
+def fmt_price(price: float) -> str:
+    return f"{price:,.2f}" if price >= 1000 else f"{price:.2f}"
 
 
-def build_table(
-    cache: PriceCache,
-    history: dict[str, deque],
-    elapsed: float,
-) -> Table:
-    """Build the price table."""
+def build_table(cache: PriceCache) -> Table:
+    """Build the live prices table using PriceCache directly."""
     table = Table(
-        title=None,
         expand=True,
         border_style="bright_black",
         header_style="bold bright_white",
         pad_edge=True,
         padding=(0, 1),
     )
-    table.add_column("Ticker", style="bold bright_white", width=8)
-    table.add_column("Price", justify="right", width=10)
-    table.add_column("Change", justify="right", width=9)
-    table.add_column("Chg %", justify="right", width=8)
-    table.add_column("", width=3)  # arrow
-    table.add_column("Sparkline", width=42, no_wrap=True)
+    table.add_column("Ticker",   style="bold bright_white", width=7)
+    table.add_column("Price",    justify="right", width=10)
+    table.add_column("Chg",      justify="right", width=8)
+    table.add_column("Tick %",   justify="right", width=8)
+    table.add_column("Daily %",  justify="right", width=8)
+    table.add_column("",         width=2)   # arrow
+    table.add_column("Sparkline (last 40 pts)", width=44, no_wrap=True)
 
     for ticker in TICKERS:
         update = cache.get(ticker)
         if update is None:
-            table.add_row(ticker, "---", "---", "---", "", "")
+            table.add_row(ticker, "---", "---", "---", "---", "", "")
             continue
 
-        # Direction styling
         if update.direction == "up":
-            color = "green"
-            arrow = "[bold green]\u25b2[/]"
+            color, arrow = "green",        "[bold green]▲[/]"
         elif update.direction == "down":
-            color = "red"
-            arrow = "[bold red]\u25bc[/]"
+            color, arrow = "red",          "[bold red]▼[/]"
         else:
-            color = "bright_black"
-            arrow = "[bright_black]\u2500[/]"
+            color, arrow = "bright_black", "[bright_black]─[/]"
 
-        price_str = f"[{color}]${format_price(update.price)}[/]"
-        change_str = f"[{color}]{update.change:+.2f}[/]"
-        pct_str = f"[{color}]{update.change_percent:+.2f}%[/]"
+        daily_color = "green" if update.daily_change_percent > 0 else (
+                      "red"   if update.daily_change_percent < 0 else "bright_black")
 
-        # Sparkline from history
-        vals = list(history.get(ticker, []))
-        spark_str = f"[bright_cyan]{sparkline(vals)}[/]" if len(vals) > 1 else ""
+        # Sparkline from PriceCache.get_history()
+        hist = cache.get_history(ticker)
+        prices = [p["price"] for p in hist[-SPARK_POINTS:]]
+        spark = f"[bright_cyan]{sparkline(prices)}[/]" if len(prices) > 1 else ""
 
-        table.add_row(ticker, price_str, change_str, pct_str, arrow, spark_str)
+        table.add_row(
+            ticker,
+            f"[{color}]${fmt_price(update.price)}[/]",
+            f"[{color}]{update.change:+.2f}[/]",
+            f"[{color}]{update.change_percent:+.2f}%[/]",
+            f"[{daily_color}]{update.daily_change_percent:+.2f}%[/]",
+            arrow,
+            spark,
+        )
 
     return table
 
 
-def build_event_log(events: deque) -> Panel:
-    """Build the event log panel."""
+def build_event_log(events: list[str]) -> Panel:
     text = Text()
     for evt in events:
         text.append(evt)
         text.append("\n")
     if not events:
-        text.append("Watching for notable moves (>1% change)...", style="bright_black italic")
+        text.append("Watching for notable moves (>1% tick change)…", style="bright_black italic")
     return Panel(
         text,
         title="[bold bright_yellow]Recent Events[/]",
@@ -120,13 +116,11 @@ def build_event_log(events: deque) -> Panel:
 
 def build_dashboard(
     cache: PriceCache,
-    history: dict[str, deque],
-    events: deque,
+    events: list[str],
     start_time: float,
 ) -> Layout:
-    """Build the full dashboard layout."""
-    elapsed = time.time() - start_time
-    remaining = max(0, DURATION - elapsed)
+    elapsed   = time.time() - start_time
+    remaining = max(0.0, DURATION - elapsed)
 
     layout = Layout()
     layout.split_column(
@@ -135,69 +129,52 @@ def build_dashboard(
         Layout(name="footer", size=10),
     )
 
-    # Header
     header_text = Text.assemble(
         ("  FinAlly ", "bold bright_yellow"),
-        ("Market Data Simulator", "bold bright_white"),
+        ("Market Data Demo", "bold bright_white"),
         ("  |  ", "bright_black"),
         (f"{elapsed:5.1f}s elapsed", "bright_cyan"),
         ("  |  ", "bright_black"),
         (f"{remaining:4.1f}s remaining", "bright_cyan"),
         ("  |  ", "bright_black"),
-        (f"{len(cache)} tickers", "bright_white"),
+        (f"{len(cache)} tickers  v{cache.version}", "bright_white"),
         ("  |  ", "bright_black"),
         ("Ctrl+C to exit", "bright_black italic"),
     )
     layout["header"].update(Panel(header_text, border_style="bright_yellow"))
-
-    # Body: price table
     layout["body"].update(
-        Panel(
-            build_table(cache, history, elapsed),
-            title="[bold bright_white]Live Prices[/]",
-            border_style="bright_black",
-        )
+        Panel(build_table(cache), title="[bold bright_white]Live Prices[/]", border_style="bright_black")
     )
-
-    # Footer: event log
     layout["footer"].update(build_event_log(events))
-
     return layout
 
 
 def print_summary(cache: PriceCache) -> None:
-    """Print final summary comparing to seed prices."""
     console = Console()
     console.print()
     console.print("[bold bright_yellow]  FinAlly[/] [bold]Session Summary[/]")
     console.print()
 
     table = Table(border_style="bright_black", header_style="bold bright_white", expand=False)
-    table.add_column("Ticker", style="bold bright_white", width=8)
-    table.add_column("Seed Price", justify="right", width=12)
-    table.add_column("Final Price", justify="right", width=12)
-    table.add_column("Session Change", justify="right", width=14)
+    table.add_column("Ticker",         style="bold bright_white", width=8)
+    table.add_column("Open Price",     justify="right", width=12)
+    table.add_column("Final Price",    justify="right", width=12)
+    table.add_column("Daily Change",   justify="right", width=13)
+    table.add_column("History Points", justify="right", width=14)
 
     for ticker in TICKERS:
-        seed = SEED_PRICES.get(ticker, 0)
         update = cache.get(ticker)
         if update is None:
             continue
-        final = update.price
-        session_change = ((final - seed) / seed) * 100 if seed else 0
-
-        if session_change > 0:
-            color = "green"
-        elif session_change < 0:
-            color = "red"
-        else:
-            color = "bright_black"
-
+        color = "green" if update.daily_change_percent > 0 else (
+                "red"   if update.daily_change_percent < 0 else "bright_black")
+        n_history = len(cache.get_history(ticker))
         table.add_row(
             ticker,
-            f"${format_price(seed)}",
-            f"[{color}]${format_price(final)}[/]",
-            f"[{color}]{session_change:+.2f}%[/]",
+            f"${fmt_price(update.open_price)}",
+            f"[{color}]${fmt_price(update.price)}[/]",
+            f"[{color}]{update.daily_change_percent:+.2f}%[/]",
+            str(n_history),
         )
 
     console.print(table)
@@ -205,60 +182,45 @@ def print_summary(cache: PriceCache) -> None:
 
 
 async def run() -> None:
-    """Main demo loop."""
-    cache = PriceCache()
+    cache  = PriceCache()
     source = SimulatorDataSource(price_cache=cache, update_interval=0.5)
-
-    # Per-ticker price history for sparklines
-    history: dict[str, deque] = {t: deque(maxlen=40) for t in TICKERS}
-
-    # Recent event log
-    events: deque = deque(maxlen=12)
+    events: list[str] = []
 
     await source.start(TICKERS)
     start_time = time.time()
 
-    # Seed initial history points
-    for ticker in TICKERS:
-        update = cache.get(ticker)
-        if update:
-            history[ticker].append(update.price)
-
     try:
         with Live(
-            build_dashboard(cache, history, events, start_time),
+            build_dashboard(cache, events, start_time),
             refresh_per_second=4,
             screen=True,
         ) as live:
             last_version = cache.version
+
             while time.time() - start_time < DURATION:
                 await asyncio.sleep(0.25)
 
-                # Check for updates
                 if cache.version == last_version:
                     continue
                 last_version = cache.version
 
-                # Record history & detect events
+                # Detect notable tick events
                 for ticker in TICKERS:
                     update = cache.get(ticker)
-                    if update is None:
-                        continue
-                    history[ticker].append(update.price)
-
-                    # Log notable moves
-                    if abs(update.change_percent) > 1.0:
-                        direction = "\u25b2" if update.direction == "up" else "\u25bc"
-                        color = "green" if update.direction == "up" else "red"
-                        timestamp = time.strftime("%H:%M:%S")
-                        events.appendleft(
-                            f"[bright_black]{timestamp}[/]  "
+                    if update and abs(update.change_percent) > 1.0:
+                        direction = "▲" if update.direction == "up" else "▼"
+                        color     = "green" if update.direction == "up" else "red"
+                        ts        = time.strftime("%H:%M:%S")
+                        events.insert(0,
+                            f"[bright_black]{ts}[/]  "
                             f"[bold {color}]{direction} {ticker}[/]  "
                             f"[{color}]{update.change_percent:+.2f}%[/]  "
-                            f"${format_price(update.price)}"
+                            f"${fmt_price(update.price)}"
                         )
+                        if len(events) > 12:
+                            events.pop()
 
-                live.update(build_dashboard(cache, history, events, start_time))
+                live.update(build_dashboard(cache, events, start_time))
 
     except KeyboardInterrupt:
         pass
