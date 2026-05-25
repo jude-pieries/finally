@@ -2,6 +2,8 @@
 
 This document describes the unified Python interface for market data in FinAlly. All downstream code (SSE streaming, portfolio valuation, trade execution) is written against this interface and is agnostic to whether prices come from the simulator or the Massive API.
 
+> **Note:** This document reflects the current implemented state. The definitive implementation blueprint (with full module code) is `MARKET_DATA_DESIGN.md`.
+
 ---
 
 ## Architecture
@@ -11,12 +13,18 @@ MarketDataSource (ABC)
 ├── SimulatorDataSource  — GBM price simulation (no API key needed)
 └── MassiveDataSource    — Polygon.io REST polling (MASSIVE_API_KEY required)
         │
-        ▼
+        ▼  writes
    PriceCache (thread-safe, in-memory)
+   ├── _prices:          dict[str, PriceUpdate]         latest price per ticker
+   ├── _open_prices:     dict[str, float]               reference price (frozen at first update)
+   ├── _history:         dict[str, deque[HistPoint]]    rolling 200-point buffer per ticker
+   └── _ticker_versions: dict[str, int]                 per-ticker change counters for SSE diff
         │
-        ├──▶ SSE stream  /api/stream/prices
-        ├──▶ Portfolio valuation
-        └──▶ Trade execution
+        reads
+        ├──→ SSE stream  GET /api/stream/prices
+        ├──→ History     GET /api/prices/{ticker}/history
+        ├──→ Portfolio valuation
+        └──→ Trade execution
 ```
 
 **Strategy pattern.** Both sources implement the same `MarketDataSource` ABC. The `factory.py` module selects the correct implementation at startup based on the `MASSIVE_API_KEY` environment variable. No other code knows which source is active.
@@ -33,7 +41,7 @@ All modules live in `backend/app/market/`.
 |------|---------------|------|
 | `models.py` | `PriceUpdate` | Immutable price snapshot dataclass |
 | `interface.py` | `MarketDataSource` | Abstract base class |
-| `cache.py` | `PriceCache` | Thread-safe in-memory price store |
+| `cache.py` | `PriceCache` | Thread-safe in-memory price store with history and versioning |
 | `simulator.py` | `SimulatorDataSource`, `GBMSimulator` | Simulation backend |
 | `massive_client.py` | `MassiveDataSource` | Massive REST polling backend |
 | `factory.py` | `create_market_data_source()` | Selects and constructs the active source |
@@ -62,29 +70,50 @@ class PriceUpdate:
     ticker:         str
     price:          float
     previous_price: float
-    timestamp:      float   # Unix seconds
+    open_price:     float   # Seed/reference price; set once on first cache update, never changed
+    timestamp:      float   # Unix seconds (default: time.time())
 
     # Computed properties
-    change:         float   # price - previous_price, rounded to 4dp
-    change_percent: float   # % change, rounded to 4dp
-    direction:      str     # "up" | "down" | "flat"
+    @property
+    def change(self) -> float: ...              # price − previous_price, rounded to 4dp
+    @property
+    def change_percent(self) -> float: ...      # tick-to-tick % change, rounded to 4dp
+    @property
+    def daily_change_percent(self) -> float: .. # (price − open_price) / open_price × 100
+    @property
+    def direction(self) -> str: ...             # "up" | "down" | "flat"
 
-    def to_dict(self) -> dict: ...  # For JSON / SSE serialization
+    def to_sse_dict(self) -> dict: ...   # Exactly 5 fields for the SSE contract
+    def to_dict(self) -> dict: ...       # All fields + computed props (portfolio/trade APIs)
 ```
 
-`PriceUpdate` is immutable (`frozen=True`). Every call to `cache.update()` creates a new instance — the previous update becomes `previous_price`.
+`PriceUpdate` is immutable (`frozen=True, slots=True`). Every `cache.update()` call creates a new instance.
 
-`to_dict()` output:
+**`to_sse_dict()` output** (exactly 5 fields — direction and daily change % derived client-side):
 
 ```python
 {
     "ticker":         "AAPL",
     "price":          191.25,
     "previous_price": 190.50,
+    "open_price":     190.00,
     "timestamp":      1717435200.0,
-    "change":         0.75,
-    "change_percent": 0.3937,
-    "direction":      "up",
+}
+```
+
+**`to_dict()` output** (full serialisation for portfolio/trade APIs):
+
+```python
+{
+    "ticker":               "AAPL",
+    "price":                191.25,
+    "previous_price":       190.50,
+    "open_price":           190.00,
+    "timestamp":            1717435200.0,
+    "change":               0.75,
+    "change_percent":       0.3937,
+    "daily_change_percent": 0.6579,
+    "direction":            "up",
 }
 ```
 
@@ -92,23 +121,38 @@ class PriceUpdate:
 
 ## PriceCache
 
-Thread-safe. A single writer (the data source background task) and multiple readers (SSE generator, portfolio routes, trade routes) can access the cache concurrently without external locking.
+Thread-safe. A single background task (the data source) writes; multiple readers (SSE generator, portfolio routes, trade routes, history endpoint) read concurrently without external locking.
 
 ```python
 class PriceCache:
+    # Writer API
     def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate
-    def get(self, ticker: str) -> PriceUpdate | None
-    def get_price(self, ticker: str) -> float | None       # Convenience
-    def get_all(self) -> dict[str, PriceUpdate]            # Shallow copy
     def remove(self, ticker: str) -> None
 
+    # Reader API
+    def get(self, ticker: str) -> PriceUpdate | None
+    def get_price(self, ticker: str) -> float | None          # Convenience
+    def get_all(self) -> dict[str, PriceUpdate]               # Shallow copy
+    def get_history(self, ticker: str) -> list[dict]          # [{price, timestamp}, ...] oldest first
+    def get_ticker_versions(self) -> dict[str, int]           # Per-ticker change counters
+
     @property
-    def version(self) -> int   # Monotonic counter; bumped on every update
+    def version(self) -> int                                  # Global monotonic counter
+
+    def __len__(self) -> int
+    def __contains__(self, ticker: str) -> bool
 ```
 
-**Version counter.** The SSE generator tracks `price_cache.version` between polling intervals. When `version` changes, prices have updated and a new event should be emitted. This produces push-on-change semantics without subscribing to individual tickers.
+**`update()` side-effects:**
+- Sets `open_price` on first call for this ticker — never updated after that
+- Appends `(price, timestamp)` to the ticker's 200-point history buffer
+- Increments both the global `version` and the per-ticker version counter
 
-First update for a ticker sets `previous_price == price` (direction `"flat"`). Subsequent updates carry the last known price as `previous_price`.
+**`remove()` side-effects:**
+- Clears the ticker from all four internal dicts (`_prices`, `_open_prices`, `_history`, `_ticker_versions`)
+- Increments the global `version` to signal SSE that the ticker list changed
+
+**Per-ticker versions** allow the SSE generator to emit only tickers whose price changed since the last emission. This matters for Massive polling where most tickers are unchanged between 15-second polls.
 
 ---
 
@@ -134,19 +178,17 @@ class MarketDataSource(ABC):
 
 **Lifecycle contract:**
 
-1. `start(tickers)` — called once at application startup. Begins the background task and seeds the cache immediately so the SSE stream has data from the first client connection.
-2. `add_ticker(ticker)` / `remove_ticker(ticker)` — dynamic watchlist changes. Take effect on the next poll cycle (Massive) or immediately (simulator, which also seeds the cache on `add_ticker`).
-3. `stop()` — called at application shutdown. Cancels the background task. Safe to call multiple times.
+1. `start(tickers)` — called once at application startup. Seeds the cache immediately before returning so SSE clients have prices from their very first connection.
+2. `add_ticker(ticker)` / `remove_ticker(ticker)` — dynamic watchlist changes. Tickers are normalised with `.upper().strip()` by all implementations.
+3. `stop()` — called at application shutdown. Cancels the background task. Idempotent.
 
-`start()` must not be called twice on the same instance. `stop()` is idempotent.
+`start()` must not be called twice on the same instance.
 
 ---
 
 ## Factory
 
 ```python
-# backend/app/market/factory.py
-
 def create_market_data_source(price_cache: PriceCache) -> MarketDataSource:
     api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
     if api_key:
@@ -162,35 +204,34 @@ The returned source is **unstarted**. Callers must `await source.start(tickers)`
 ## SSE Stream
 
 ```python
-# backend/app/market/stream.py
-
 def create_stream_router(price_cache: PriceCache) -> APIRouter:
-    ...
+    ...  # Returns a fresh APIRouter with GET /api/stream/prices
 ```
 
-Returns a FastAPI `APIRouter` with one endpoint: `GET /api/stream/prices`.
+**Behaviour:**
+- Long-lived SSE connection via native `EventSource` API
+- **Push-on-change**: emits only when at least one ticker's per-ticker version counter advances. Unchanged tickers are never re-sent.
+- **Keepalive**: emits `: keepalive` every 10 seconds when no data event has been sent — prevents proxy timeouts during slow Massive poll cycles
+- **Retry directive**: `retry: 1000\n\n` sent at connection start — EventSource reconnects in 1 second on disconnect
+- **Disconnect detection**: polls `request.is_disconnected()` every 500ms
 
-**Behavior:**
-- Long-lived SSE connection; client uses the native `EventSource` API
-- Push-on-change: only emits when `price_cache.version` increments (i.e., when a price actually updates)
-- Keepalive: sends `retry: 1000\n\n` at connection start; EventSource auto-reconnects in 1 second on disconnect
-- Disconnect detection: polls `request.is_disconnected()` each 500ms interval
-
-**Event format:**
-
-```
-data: {"AAPL": {"ticker": "AAPL", "price": 191.25, "previous_price": 190.50, ...}, "TSLA": {...}}
+**Event format** (only changed tickers included):
 
 ```
+data: {"AAPL": {"ticker": "AAPL", "price": 191.25, "previous_price": 190.50,
+                "open_price": 190.00, "timestamp": 1717435200.0},
+       "TSLA": {"ticker": "TSLA", "price": 251.80, "previous_price": 250.00,
+                "open_price": 250.00, "timestamp": 1717435200.0}}
 
-A single event carries all tracked tickers. The client merges this into its local price state.
+```
+
+Frontend computes daily change %: `(price - open_price) / open_price * 100`.
 
 ---
 
 ## Application Wiring
 
 ```python
-# FastAPI startup (pseudocode — adapt to your lifespan handler)
 from app.market import PriceCache, create_market_data_source, create_stream_router
 
 price_cache = PriceCache()
@@ -198,32 +239,23 @@ market_source = create_market_data_source(price_cache)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    initial_tickers = get_watchlist_from_db()
-    await market_source.start(initial_tickers)
+    await init_db()                                          # DB must be ready first
+    initial_tickers = await get_watchlist_tickers()         # Read from DB
+    await market_source.start(initial_tickers)              # Seeds cache immediately
     app.include_router(create_stream_router(price_cache))
     yield
     await market_source.stop()
 ```
 
-**Important:** the database must be initialized before `market_source.start()` is called, so `get_watchlist_from_db()` can read the seed tickers. This matches the decision in PLAN.md to initialize the database at startup-time.
-
----
-
-## Watchlist Change Handlers
-
-When the user adds or removes a ticker via the watchlist REST API:
+**Watchlist handlers** must call `add_ticker`/`remove_ticker` in the same request that modifies the database — there is no background reconciliation:
 
 ```python
-# POST /api/watchlist  → add ticker
+# POST /api/watchlist
 await market_source.add_ticker(ticker)
 
-# DELETE /api/watchlist/{ticker}  → remove ticker
+# DELETE /api/watchlist/{ticker}
 await market_source.remove_ticker(ticker)
 ```
-
-Both implementations handle these calls safely:
-- **SimulatorDataSource:** updates the `GBMSimulator` immediately and seeds the cache so the new ticker has a price before the next SSE event.
-- **MassiveDataSource:** adds/removes from the in-memory ticker list; the change takes effect on the next poll cycle (up to `poll_interval` seconds later).
 
 ---
 
@@ -234,51 +266,36 @@ Both implementations handle these calls safely:
 update: PriceUpdate | None = price_cache.get("AAPL")
 price:  float | None        = price_cache.get_price("AAPL")
 
-# All tickers (e.g., for portfolio valuation)
+# All tickers (portfolio valuation)
 all_prices: dict[str, PriceUpdate] = price_cache.get_all()
-for ticker, update in all_prices.items():
-    print(ticker, update.price, update.direction)
+total_value = cash_balance + sum(
+    pos.quantity * all_prices[pos.ticker].price
+    for pos in positions
+    if pos.ticker in all_prices
+)
+
+# Price history (chart endpoint)
+history = price_cache.get_history("AAPL")
+# → [{"price": 190.12, "timestamp": 1717435000.0}, ...]  up to 200 entries, oldest first
 ```
 
 ---
 
 ## Configuration Reference
 
-### SimulatorDataSource
-
 ```python
+# Simulator — tune for demo feel
 SimulatorDataSource(
-    price_cache:      PriceCache,
-    update_interval:  float = 0.5,     # seconds between ticks
-    event_probability: float = 0.001,  # chance of a shock event per tick per ticker
+    price_cache=cache,
+    update_interval=0.5,       # seconds between ticks
+    event_probability=0.001,   # probability of shock event per tick per ticker
 )
-```
 
-### MassiveDataSource
-
-```python
+# Massive — tune for plan tier
 MassiveDataSource(
-    api_key:       str,
-    price_cache:   PriceCache,
-    poll_interval: float = 15.0,   # seconds between API calls (15s = safe for free tier)
+    api_key=key,
+    price_cache=cache,
+    poll_interval=15.0,   # Free tier: 5 req/min → 15s minimum
+                          # Paid tiers: lower to 2–5s
 )
 ```
-
-For paid Massive plans, lower `poll_interval` to 2–5 seconds:
-
-```python
-MassiveDataSource(api_key=key, price_cache=cache, poll_interval=5.0)
-```
-
----
-
-## Extending the Interface
-
-To add a new data source (e.g., Alpaca, Finnhub):
-
-1. Create a new module in `backend/app/market/`.
-2. Subclass `MarketDataSource` and implement all five abstract methods.
-3. Update `factory.py` to select the new source based on an environment variable.
-4. Write tests in `backend/tests/market/` following the patterns in `test_massive.py`.
-
-No other code needs to change. The `PriceCache` interface is stable.
