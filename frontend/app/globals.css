@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+/* FinAlly Terminal Dark Theme */
+:root {
+  --bg-primary: #0d1117;
+  --bg-panel: #161b22;
+  --bg-card: #1c2128;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-muted: #8b949e;
+  --accent-yellow: #ecad0a;
+  --accent-blue: #209dd7;
+  --accent-purple: #753991;
+  --color-green: #3fb950;
+  --color-red: #f85149;
+}
+
+/* Price flash animations */
+@keyframes flash-up {
+  0% {
+    background-color: rgba(63, 185, 80, 0.3);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+@keyframes flash-down {
+  0% {
+    background-color: rgba(248, 81, 73, 0.3);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.flash-up {
+  animation: flash-up 0.5s ease-out forwards;
+}
+
+.flash-down {
+  animation: flash-down 0.5s ease-out forwards;
+}
+
+/* Base body styles */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: #0d1117;
+  color: #e6edf3;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #8b949e;
+}
+
+/* Smooth number transitions */
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Remove number input spinners for cleaner look */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+}
